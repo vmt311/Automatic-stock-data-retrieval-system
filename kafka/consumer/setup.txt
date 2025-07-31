@@ -1,0 +1,4 @@
+kafka-python
+boto3
+botocore
+python-dotenv

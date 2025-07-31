@@ -1,0 +1,121 @@
+# version: '3.8'
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.0.1
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
+  kafka:
+    image: confluentinc/cp-kafka:7.0.1
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    # volumes:
+    #   - ./kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "kafka:9092", "--list"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  consumer:
+    build:
+      context: kafka/consumer
+      dockerfile: Dockerfile
+    container_name: consumer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER: "kafka:9092"
+      KAFKA_TOPIC: "stock_prices"
+      BATCH_SIZE: 10
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME}
+    restart: unless-stopped
+
+  spark:
+    image: bitnami/spark:3.5.0  # Sử dụng phiên bản cụ thể thay vì latest
+    container_name: spark
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'  # Giới hạn tối đa 2 CPU cores
+          memory: 4G   # Giới hạn bộ nhớ
+    environment:
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=4g
+      - SPARK_DRIVER_MEMORY=2g
+      - SPARK_EXECUTOR_MEMORY=2g
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+      - IVY_TIMEOUT=300000
+    ports:
+      - "4040:4040"  # Spark UI
+      - "8080:8080"  # Spark Master UI
+    volumes:
+      - ./spark:/opt/spark-app
+      - ./jars:/opt/bitnami/spark/jars/extra  # Thêm thư viện tùy chỉnh
+    command: [
+      "/opt/bitnami/spark/bin/spark-submit",
+      "--master", "local[*]",
+      "--packages", "org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262,org.postgresql:postgresql:42.6.0",
+      "--conf", "spark.jars=/opt/bitnami/spark/jars/extra/*",
+      "--conf", "spark.driver.extraClassPath=/opt/bitnami/spark/jars/extra/*",
+      "--conf", "spark.executor.extraClassPath=/opt/bitnami/spark/jars/extra/*",
+      "--conf", "spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider",
+      "--conf", "spark.hadoop.fs.s3a.endpoint=s3.${AWS_REGION}.amazonaws.com",
+      "--conf", "spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem",
+      "--conf", "spark.hadoop.fs.s3a.path.style.access=true",
+      "/opt/spark-app/spark_etl.py"
+    ]
+    depends_on:
+      - postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d stockdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  postgres:
+    image: postgres:13
+    container_name: postgres
+    environment:
+      POSTGRES_DB: stockdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
+  # kafka-data:
