@@ -1,0 +1,8 @@
+apache-airflow-providers-apache-spark
+apache-airflow-providers-openlineage>=1.8.0
+pandas
+pyspark
+yfinance
+kafka-python
+confluent-kafka
+boto3

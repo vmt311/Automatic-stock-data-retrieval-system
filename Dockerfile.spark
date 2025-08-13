@@ -1,0 +1,15 @@
+FROM bitnami/spark:4.0.0
+
+USER root
+
+# Cài wget để tải jar (nếu chưa có)
+RUN apt-get update && apt-get install -y wget && apt-get clean
+
+ENV SPARK_JARS_DIR=/opt/bitnami/spark/jars
+
+ADD https://jdbc.postgresql.org/download/postgresql-42.6.0.jar $SPARK_JARS_DIR
+ADD https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar $SPARK_JARS_DIR
+ADD https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar $SPARK_JARS_DIR
+
+
+USER 1001

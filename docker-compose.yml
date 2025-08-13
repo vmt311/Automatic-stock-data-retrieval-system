@@ -1,4 +1,30 @@
 # version: '3.8'
+# COMMON__________________________________________________________________________________
+x-spark-common: &spark-common
+  image: bitnami/spark:4.0.0
+  volumes:
+    - ./spark/jobs:/opt/bitnami/spark/jobs
+    # - ./jars:/opt/bitnami/spark/jars/extra
+  networks:
+    - stock_network
+
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file:
+    - airflow.env
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./spark/jobs:/opt/bitnami/spark/jobs
+    # - ./jars:/opt/bitnami/spark/jars/extra
+    - ./kafka:/opt/airflow/kafka
+  depends_on:
+    - postgres
+  networks:
+    - stock_network
+
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.0.1
@@ -12,6 +38,8 @@ services:
       interval: 5s
       timeout: 2s
       retries: 10
+    networks:
+      - stock_network
 
   kafka:
     image: confluentinc/cp-kafka:7.0.1
@@ -19,103 +47,122 @@ services:
     depends_on:
       zookeeper:
         condition: service_healthy
+    command: "bash -c 'echo \"Waiting for Zookeeper to be healthy...\" && sleep 10 && /etc/confluent/docker/run'"
     ports:
       - "9092:9092"
       - "29092:29092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-    # volumes:
-    #   - ./kafka-data:/var/lib/kafka/data
+      KAFKA_NUM_PARTITIONS: 3  # Thêm số partition mặc định
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1  # Thêm replication factor mặc định
+
     healthcheck:
       test: ["CMD", "kafka-topics", "--bootstrap-server", "kafka:9092", "--list"]
       interval: 5s
       timeout: 5s
       retries: 10
-
-  consumer:
-    build:
-      context: kafka/consumer
-      dockerfile: Dockerfile
-    container_name: consumer
-    depends_on:
-      kafka:
-        condition: service_healthy
-    environment:
-      KAFKA_BROKER: "kafka:9092"
-      KAFKA_TOPIC: "stock_prices"
-      BATCH_SIZE: 10
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
-      S3_BUCKET_NAME: ${S3_BUCKET_NAME}
-    restart: unless-stopped
-
-  spark:
-    image: bitnami/spark:3.5.0  # Sử dụng phiên bản cụ thể thay vì latest
-    container_name: spark
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'  # Giới hạn tối đa 2 CPU cores
-          memory: 4G   # Giới hạn bộ nhớ
-    environment:
-      - SPARK_WORKER_CORES=2
-      - SPARK_WORKER_MEMORY=4g
-      - SPARK_DRIVER_MEMORY=2g
-      - SPARK_EXECUTOR_MEMORY=2g
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - AWS_REGION=${AWS_REGION}
-      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
-      - IVY_TIMEOUT=300000
-    ports:
-      - "4040:4040"  # Spark UI
-      - "8080:8080"  # Spark Master UI
-    volumes:
-      - ./spark:/opt/spark-app
-      - ./jars:/opt/bitnami/spark/jars/extra  # Thêm thư viện tùy chỉnh
-    command: [
-      "/opt/bitnami/spark/bin/spark-submit",
-      "--master", "local[*]",
-      "--packages", "org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262,org.postgresql:postgresql:42.6.0",
-      "--conf", "spark.jars=/opt/bitnami/spark/jars/extra/*",
-      "--conf", "spark.driver.extraClassPath=/opt/bitnami/spark/jars/extra/*",
-      "--conf", "spark.executor.extraClassPath=/opt/bitnami/spark/jars/extra/*",
-      "--conf", "spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider",
-      "--conf", "spark.hadoop.fs.s3a.endpoint=s3.${AWS_REGION}.amazonaws.com",
-      "--conf", "spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem",
-      "--conf", "spark.hadoop.fs.s3a.path.style.access=true",
-      "/opt/spark-app/spark_etl.py"
-    ]
-    depends_on:
-      - postgres
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d stockdb"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
+    networks:
+      - stock_network
 
   postgres:
-    image: postgres:13
-    container_name: postgres
-    environment:
-      POSTGRES_DB: stockdb
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
+      image: postgres:13
+      container_name: postgres
+      environment:
+        POSTGRES_DB: stockdb
+        POSTGRES_USER: postgres
+        POSTGRES_PASSWORD: postgres
+      ports:
+        - "5432:5432"
+      volumes:
+        - postgres_data:/var/lib/postgresql/data
+        - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+      healthcheck:
+        test: ["CMD-SHELL", "pg_isready -U postgres -d stockdb"]
+        interval: 5s
+        timeout: 5s
+        retries: 10
+      networks:
+      - stock_network
 
+
+  # REDIS __________________________________________________________________________________
+  redis:
+    image: redis:6.2-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    networks:
+      - stock_network
+
+
+  # SPARK SET UP ___________________________________________________________________________
+  spark-master:
+    <<: *spark-common
+    command: bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      SPARK_MODE: master
+    ports:
+      - "9090:8080"
+      - "7077:7077"
+
+  spark-worker:
+    <<: *spark-common
+    command: bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    depends_on:
+      - spark-master
+    environment:
+      SPARK_MODE: worker
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 1g
+      SPARK_MASTER_URL: spark://spark-master:7077
+
+
+  # AIRFLOW SET UP __________________________________________________________________________
+  airflow-init:
+    <<: *airflow-common
+    command: >
+      bash -c "airflow db migrate &&
+      airflow users create --username admin --firstname admin --lastname admin --role Admin --password admin --email admin@example.com || true"
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: ["airflow", "webserver"]
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+  
+  airflow-scheduler:
+    <<: *airflow-common
+    command: ["airflow", "scheduler"]
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+  
+  airflow-worker:
+    <<: *airflow-common
+    command: ["airflow", "celery", "worker"]
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+  
+
+networks:
+  stock_network:
+    driver: bridge
+  
 volumes:
   postgres_data:
-  # kafka-data:

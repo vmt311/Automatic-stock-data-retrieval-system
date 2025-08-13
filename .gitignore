@@ -11,4 +11,11 @@ wheels/
 
 .env
 
-jars
+.python-version
+
+pyproject.toml
+
+uv.lock
+
+jars/
+

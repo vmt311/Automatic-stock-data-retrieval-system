@@ -1,20 +1,20 @@
-from kafka import KafkaProducer
-import yfinance as yf
+import os
 import json
-import time
-import warnings
-# Sử dụng ThreadPoolExecutor để tải song song các ticker
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import yfinance as yf
+from datetime import datetime, timedelta
+from confluent_kafka import Producer
+import pytz
+import sys
 
-# Ẩn các cảnh báo FutureWarning
-warnings.simplefilter(action='ignore', category=FutureWarning)
+from dotenv import load_dotenv
 
-producer = KafkaProducer(
-    bootstrap_servers='localhost:29092',
-    value_serializer= lambda v: json.dumps(v).encode('utf-8')
-)
+load_dotenv()
 
-# Danh sách ticker với thông tin dự phòng
+# Cấu hình Kafka từ biến môi trường
+KAFKA_BROKER = os.getenv('KAFKA_BROKER', 'kafka:9092')
+KAFKA_TOPIC = os.getenv('KAFKA_TOPIC', 'stock_prices')
+
+# Danh sách cổ phiếu quan tâm
 TICKERS = [
     {"symbol": "MSFT", "name": "Microsoft"},
     {"symbol": "AAPL", "name": "Apple"},
@@ -28,67 +28,137 @@ TICKERS = [
     {"symbol": "NFLX", "name": "Netflix"}
 ]
 
-# Ham lay gia co phieu, tra ve dang json
-def fetch_latest(ticker_info):
-    """Lấy dữ liệu chứng khoán với xử lý lỗi chi tiết"""
-    ticker = ticker_info["symbol"]
+def delivery_report(err, msg):
+    """Callback xác nhận gửi message thành công hay thất bại"""
+    if err is not None:
+        print(f'Gửi message thất bại: {err}')
+    else:
+        print(f'Message đã gửi đến [{msg.topic()}] partition [{msg.partition()}]')
+
+def create_kafka_producer():
+    """Tạo và cấu hình Kafka Producer"""
+    conf = {
+        'bootstrap.servers': KAFKA_BROKER,
+        'message.timeout.ms': 30000,     # 30s timeout
+        'enable.idempotence': True,       # Đảm bảo gửi chính xác một lần
+        'acks': 'all',                    # Yêu cầu xác nhận từ tất cả replica
+        'retries': 5,                     # Số lần thử lại khi gặp lỗi
+        'compression.type': 'snappy',     # Nén dữ liệu để tiết kiệm băng thông
+    }
+    return Producer(conf)
+
+def is_weekday(date_str):
+    date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
+    return date_obj.weekday() < 5  # 0-4 là thứ 2 đến thứ 6
+
+def fetch_stock_data(ticker_info, date_str):
+    """
+    Lấy dữ liệu chứng khoán từ Yahoo Finance
+    :param ticker_info: Thông tin cổ phiếu (symbol và name)
+    :param date_str: Ngày cần lấy dữ liệu (YYYY-MM-DD)
+    :return: Danh sách các bản ghi dữ liệu
+    """
+    symbol = ticker_info["symbol"]
     try:
-        # Thêm timeout và retry
+        # Chuyển đổi ngày và tính ngày tiếp theo
+        date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+        next_day = date_obj + timedelta(days=1)
+        
+        # Lấy dữ liệu theo phút
         df = yf.download(
-            ticker,
-            period="1d",
+            symbol,
+            start=date_obj.strftime("%Y-%m-%d"),
+            end=next_day.strftime("%Y-%m-%d"),
             interval="1m",
-            auto_adjust=False,
             progress=False,
-            timeout=10
+            auto_adjust=True
         )
         
         if df.empty:
-            print(f"No data for {ticker}")
-            return None
+            print(f"⚠️ Không có dữ liệu cho {symbol} ngày {date_str}")
+            return []
+        
+        # Chuyển đổi dữ liệu thành định dạng JSON
+        records = []
+        for timestamp, row in df.iterrows():
+            # Chuyển đổi múi giờ thành UTC
+            utc_timestamp = timestamp.tz_convert(pytz.UTC).isoformat()
             
-        latest = df.iloc[-1]
-        return {
-            "ticker": ticker,
-            "name": ticker_info["name"],
-            "datetime": str(latest.name),
-            "open": float(latest["Open"].iloc[0]) if hasattr(latest["Open"], 'iloc') else float(latest["Open"]),
-            "high": float(latest["High"].iloc[0]) if hasattr(latest["High"], 'iloc') else float(latest["High"]),
-            "low": float(latest["Low"].iloc[0]) if hasattr(latest["Low"], 'iloc') else float(latest["Low"]),
-            "close": float(latest["Close"].iloc[0]) if hasattr(latest["Close"], 'iloc') else float(latest["Close"]),
-            "volume": int(latest["Volume"].iloc[0]) if hasattr(latest["Volume"], 'iloc') else int(latest["Volume"])
-        }
+            records.append({
+                "symbol": symbol,
+                "name": ticker_info["name"],
+                "timestamp": utc_timestamp,
+                "open": round(float(row["Open"]), 4),  # Thêm .iloc[0]
+                "high": round(float(row["High"]), 4),
+                "low": round(float(row["Low"]), 4),
+                "close": round(float(row["Close"]), 4),
+                "volume": int(row["Volume"]),  # Thêm .iloc[0]
+                "process_date": date_str
+            })
+        
+        print(f"✅ Đã lấy {len(records)} bản ghi cho {symbol}")
+        return records
+        
     except Exception as e:
-        print(f"Error fetching {ticker}: {str(e)}")
-        return None
+        print(f"❌ Lỗi khi lấy dữ liệu {symbol}: {str(e)}")
+        return []
 
-def process_ticker(ticker_info):
-    """Xử lý từng ticker và gửi dữ liệu"""
-    data = fetch_latest(ticker_info)
-    if data:
-        producer.send("stock_prices", value=data)
-        return f"Sent: {ticker_info['symbol']}"
-    return None
+def produce_stock_data(producer, date_str):
+    """
+    Gửi dữ liệu chứng khoán đến Kafka
+    :param producer: Kafka Producer
+    :param date_str: Ngày cần xử lý
+    :return: Tổng số message đã gửi
+    """
+    total_messages = 0
+    
+    for ticker in TICKERS:
+        data_points = fetch_stock_data(ticker, date_str)
+        
+        for data in data_points:
+            # Gửi message đến Kafka
+            producer.produce(
+                topic=KAFKA_TOPIC,
+                key=ticker["symbol"].encode('utf-8'),  # Sử dụng symbol làm key
+                value=json.dumps(data).encode('utf-8'),
+                callback=delivery_report
+            )
+            total_messages += 1
+            
+            # Xử lý sự kiện để kích hoạt gửi message
+            producer.poll(0)
+    
+    # Đảm bảo tất cả message đã được gửi
+    producer.flush()
+    print(f"🚀 Đã gửi tổng cộng {total_messages} message đến Kafka")
+    return total_messages
+
+def main(date_str):
+    """
+    Hàm chính để chạy producer (airflow sẽ gọi hàm này)
+    :param date_str: Ngày cần xử lý (YYYY-MM-DD). Nếu không có, sẽ sử dụng ngày hiện tại
+    """
+    if date_str is None:
+        # Sửa thành cách mới để tránh warning và lấy ngày hiện tại với timezone
+        date_str = datetime.now(pytz.UTC).strftime("%Y-%m-%d")
+    else:
+        # Kiểm tra nếu ngày nhập vào là tương lai
+        input_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        today = datetime.now(pytz.UTC).date()
+        if input_date > today:
+            print(f"⚠️ Cảnh báo: Ngày {date_str} là ngày tương lai, sẽ sử dụng ngày hôm nay thay thế")
+            date_str = today.strftime("%Y-%m-%d")
+    
+    print(f"🔄 Bắt đầu producer cho ngày {date_str}")
+    kafka_producer = create_kafka_producer()
+    total_messages = produce_stock_data(kafka_producer, date_str)
+    print(f"🏁 Hoàn thành producer cho ngày {date_str}")
+
+    if not is_weekday(date_str):
+        print(f"⚠️ Ngày {date_str} là cuối tuần, không có dữ liệu giao dịch")
+        return 0
 
 if __name__ == "__main__":
-    # Giới hạn số luồng để tránh quá tải
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        for i in range(5):  # Lặp 5 lần
-            print(f"\nBatch {i+1}:")
-            futures = [executor.submit(process_ticker, ticker) for ticker in TICKERS]
-            
-            for future in as_completed(futures):
-                try:
-                    result = future.result()
-                    if result:
-                        print(result)
-                except Exception as e:
-                    print(f"Processing error: {str(e)}")
-            
-            # Đợi 60 giây giữa các batch
-            if i < 4:  # Không đợi sau batch cuối
-                time.sleep(60)
-    
-    # Đảm bảo tất cả message được gửi
-    producer.flush()
-    print("\nCompleted all batches")
+    # Cho phép chạy độc lập với tham số dòng lệnh
+    date_arg = sys.argv[1] if len(sys.argv) > 1 else None
+    main(date_arg)
